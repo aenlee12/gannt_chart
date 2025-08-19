@@ -15,14 +15,19 @@ def find_col(cols_map, subs):
                 return orig
     return None
 
-def coerce_int(x):
+def safe_int(x):
     try:
-        return int(str(x).strip())
+        # отфильтруем NaN/пустые
+        if x is None: return None
+        s = str(x).strip()
+        if s == "" or s.lower() == "nan":
+            return None
+        return int(float(s))  # на случай "101.0"
     except:
-        return np.nan
+        return None
 
 def parse_bool01(x):
-    if pd.isna(x): return 0
+    if x is None: return 0
     s = str(x).strip().lower()
     if s in {"1","да","true","истина","y","yes"}: return 1
     if s in {"0","нет","false","ложь","n","no",""}: return 0
@@ -39,10 +44,11 @@ def parse_preds(x):
     for p in parts:
         p = p.strip()
         if not p: continue
-        if p.isdigit():
+        if re.fullmatch(r"\d+", p):
             ids.append(int(p))
         else:
             ids += [int(n) for n in re.findall(r"\d+", p)]
+    # уникальные, с сохранением порядка
     seen, out = set(), []
     for i in ids:
         if i not in seen:
@@ -85,7 +91,7 @@ def build_df(src: pd.DataFrame):
     bad = df["End"].notna() & df["Start"].notna() & (df["End"] <= df["Start"])
     df.loc[bad, "End"] = df.loc[bad, "Start"] + pd.to_timedelta(1, unit="D")
 
-    df["ID"] = df[col_id].apply(coerce_int)
+    df["ID"] = df[col_id].apply(safe_int)
     df["Predecessors"] = df[col_dep].apply(parse_preds) if col_dep else [[] for _ in range(len(df))]
     df["Status"] = df[col_stat].apply(norm_status) if col_stat else ""
 
@@ -93,6 +99,7 @@ def build_df(src: pd.DataFrame):
     df = df[df[col_name].notna() & df["Start"].notna() & df["End"].notna()].copy()
     df = df[df["Status"] != "новый"].copy()
 
+    # роли из флагов, если заданы
     if col_head or col_sub:
         df["IsHeadFlag"]    = df[col_head].apply(parse_bool01) if col_head else 0
         df["IsSubheadFlag"] = df[col_sub].apply(parse_bool01)  if col_sub else 0
@@ -106,53 +113,67 @@ def build_df(src: pd.DataFrame):
         df["IsHeadFlag"] = (df["Role"]=="head").astype(int)
         df["IsSubheadFlag"] = 0
 
-    valid_ids = set(df["ID"].dropna().astype(int))
-    id_to_role = {int(i): r for i, r in zip(df["ID"], df["Role"]) if not pd.isna(i)}
+    valid_ids = {i for i in df["ID"].dropna().tolist()}
+    id_to_role = {i: r for i, r in zip(df["ID"], df["Role"]) if i is not None}
 
+    # Родитель: сначала берём из предшественников head/subhead, иначе используем текущий контекст
     parent = []
     cur_head, cur_sub = None, None
     for _, row in df.sort_values("__order").iterrows():
         pid = None
         preds = [p for p in row["Predecessors"] if p in valid_ids]
-        for p in preds[::-1]:
+        for p in reversed(preds):
             if id_to_role.get(p) in {"subhead","head"}:
                 pid = p; break
         if pid is None:
-            if row["Role"] == "head":
-                cur_head, cur_sub = int(row["ID"]), None
+            role = row["Role"]
+            rid = row["ID"]
+            if role == "head":
+                cur_head, cur_sub = rid, None
                 pid = None
-            elif row["Role"] == "subhead":
+            elif role == "subhead":
                 pid = cur_head
-                cur_sub = int(row["ID"])
+                cur_sub = rid
             else:
                 pid = cur_sub if cur_sub is not None else cur_head
         parent.append(pid)
     df["ParentID"] = parent
 
+    # дети
     children = {}
     for tid, p in zip(df["ID"], df["ParentID"]):
-        if pd.isna(tid): continue
+        if tid is None: 
+            continue
         if p is not None:
-            children.setdefault(int(p), []).append(int(tid))
+            children.setdefault(p, []).append(tid)
 
     def child_tasks(ids):
         if not ids: return []
         sub = df[df["ID"].isin(ids)]
-        return sub[sub["Role"]=="task"]["ID"].astype(int).tolist()
+        return sub[sub["Role"]=="task"]["ID"].tolist()
 
+    # прогресс подголовной
     sub_progress = {}
     for _, r in df[df["Role"]=="subhead"].iterrows():
-        kids = child_tasks(children.get(int(r["ID"]), []))
+        rid = r["ID"]
+        if rid is None:
+            sub_progress[rid] = 0.0
+            continue
+        kids = child_tasks(children.get(rid, []))
         if not kids:
-            sub_progress[int(r["ID"])] = 0.0
+            sub_progress[rid] = 0.0
         else:
             rows = df[df["ID"].isin(kids)]
             total = len(rows); done = (rows["Status"]=="сделано").sum()
-            sub_progress[int(r["ID"])] = 100.0*done/total
+            sub_progress[rid] = 100.0*done/total
 
+    # прогресс головной
     head_progress = {}
     for _, r in df[df["Role"]=="head"].iterrows():
-        hid = int(r["ID"])
+        hid = r["ID"]
+        if hid is None:
+            head_progress[hid] = 0.0
+            continue
         kids = children.get(hid, [])
         if not kids:
             head_progress[hid] = 0.0
@@ -174,9 +195,10 @@ def build_df(src: pd.DataFrame):
 
         head_progress[hid] = float(np.average(values, weights=weights)) if weights else 0.0
 
+    # финальный прогресс по строкам
     prog = []
     for _, r in df.iterrows():
-        rid = int(r["ID"]) if not pd.isna(r["ID"]) else None
+        rid = r["ID"]
         if r["Role"] == "head":
             prog.append(head_progress.get(rid, 0.0))
         elif r["Role"] == "subhead":
@@ -185,32 +207,35 @@ def build_df(src: pd.DataFrame):
             prog.append(np.nan)
     df["ProgressPct"] = prog
 
+    # порядок: head -> subhead -> tasks, затем остатки
     out_rows, seen = [], set()
     base = df.sort_values("__order")
-    by_id = {int(i): row for i, row in zip(df["ID"], df.itertuples(index=False)) if not pd.isna(i)}
+    by_id = {i: row for i, row in zip(df["ID"], df.itertuples(index=False)) if i is not None}
 
     def push_row(row_tuple):
         out_rows.append(pd.Series(row_tuple._asdict()))
 
     for row in base.itertuples(index=False):
-        rid = int(row.ID) if not pd.isna(row.ID) else None
-        if rid is None or rid in seen: continue
+        rid = row.ID
+        if rid in seen: 
+            continue
         if row.Role == "head":
             push_row(row); seen.add(rid)
             for sid in children.get(rid, []):
-                if by_id.get(sid) and by_id[sid].Role == "subhead":
+                if sid in by_id and by_id[sid].Role == "subhead" and sid not in seen:
                     push_row(by_id[sid]); seen.add(sid)
                     for tid in children.get(sid, []):
-                        if by_id.get(tid) and by_id[tid].Role == "task" and tid not in seen:
+                        if tid in by_id and by_id[tid].Role == "task" and tid not in seen:
                             push_row(by_id[tid]); seen.add(tid)
 
     for row in base.itertuples(index=False):
-        rid = int(row.ID) if not pd.isna(row.ID) else None
+        rid = row.ID
         if rid is not None and rid not in seen:
             push_row(row); seen.add(rid)
 
     out = pd.DataFrame(out_rows)
 
+    # подписи
     labels = []
     for name, role in zip(out[col_name], out["Role"]):
         nm = shorten(name, 80)
@@ -231,11 +256,11 @@ def make_fig(data, scale="Месяц", show_subheads=True):
 
     d = data.copy()
 
-    # скрыть подголовные визуально, оставив их задачи под головной
+    # скрыть подголовные, оставив их задачи
     if not show_subheads:
-        id_to_role = {int(i): r for i, r in zip(d["ID"], d["Role"]) if not pd.isna(i)}
-        parent_role = d["ParentID"].map(lambda p: id_to_role.get(int(p)) if p is not None and not pd.isna(p) else None)
-        # удваиваем маркер у задач, чьим родителем была подголовная
+        id_to_role = {i: r for i, r in zip(d["ID"], d["Role"]) if i is not None}
+        parent_role = d["ParentID"].map(lambda p: id_to_role.get(p) if p is not None else None)
+
         def relabel(row, pr):
             lbl = row["Label"]
             if row["Role"] == "task" and pr == "subhead":
@@ -278,7 +303,8 @@ def make_fig(data, scale="Месяц", show_subheads=True):
     x_text = max_end + pad
     for lbl, role, pct in zip(d["Label"], d["Role"], d["ProgressPct"]):
         if role in ("head","subhead"):
-            fig.add_annotation(x=x_text, y=lbl, text=f"{(0 if pd.isna(pct) else pct):.0f} %",
+            val = 0.0 if pd.isna(pct) else float(pct)
+            fig.add_annotation(x=x_text, y=lbl, text=f"{val:.0f} %",
                                showarrow=False, xanchor="left", font=dict(size=11))
 
     if scale == "День":
@@ -291,6 +317,7 @@ def make_fig(data, scale="Месяц", show_subheads=True):
         fig.update_xaxes(dtick="M3", tickformat="%b %Y")
 
     fig.update_yaxes(categoryorder="array", categoryarray=d["Label"].iloc[::-1].tolist())
+
     fig.update_layout(
         barmode="overlay", bargap=0.25, title="План-график проекта",
         height=max(650, int(36*len(d))),
